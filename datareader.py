@@ -1,3 +1,4 @@
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,6 +9,20 @@ from medmnist import ChestMNIST
 # --- Konfigurasi Kelas Biner ---
 CLASS_A_IDX = 1  # 'Cardiomegaly'
 CLASS_B_IDX = 7 # 'Pneumothorax'
+
+# --- Data Augmentation untuk Training (Medical-Safe) ---
+# NOTE: Augmentation MENURUNKAN performa untuk dataset ini!
+# Best practice: TIDAK menggunakan augmentation
+TRAIN_TRANSFORM = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5])  # Normalisasi
+])
+
+# --- Transform untuk Validation (tanpa augmentation) ---
+VAL_TRANSFORM = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5])
+])
 
 NEW_CLASS_NAMES = {0: 'Cardiomegaly', 1: 'Pneumothorax'}
 ALL_CLASS_NAMES = [
@@ -70,14 +85,30 @@ class FilteredBinaryDataset(Dataset):
             
         return image, torch.tensor([label])
 
-def get_data_loaders(batch_size):
-    data_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[.5], std=[.5]),
-    ])
+def get_data_loaders(batch_size, use_augmentation=True):
+    """
+    Get data loaders with optional data augmentation for training.
+    
+    Args:
+        batch_size: Batch size for dataloaders
+        use_augmentation: If True, apply data augmentation to training data
+    
+    Returns:
+        train_loader, val_loader, num_classes, in_channels
+    """
+    # Use augmentation for training if enabled
+    if use_augmentation:
+        train_transform = TRAIN_TRANSFORM
+        print("✅ Data Augmentation AKTIF untuk training data")
+    else:
+        train_transform = VAL_TRANSFORM
+        print("⚠️  Data Augmentation TIDAK AKTIF")
+    
+    # Validation always uses basic transform (no augmentation)
+    val_transform = VAL_TRANSFORM
 
-    train_dataset = FilteredBinaryDataset('train', data_transform)
-    val_dataset = FilteredBinaryDataset('test', data_transform)
+    train_dataset = FilteredBinaryDataset('train', train_transform)
+    val_dataset = FilteredBinaryDataset('test', val_transform)
     
     train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, shuffle=False)
