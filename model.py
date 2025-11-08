@@ -1,177 +1,97 @@
 """
-Ensemble Model untuk ChestMNIST Binary Classification
-Menggabungkan SimpleCNN Enhanced + ResNet18 untuk performa maksimal
+MobileNetV3-Large Model for ChestMNIST Binary Classification
+Lightweight and fast architecture optimized for speed and accuracy
 """
 
 import torch
 import torch.nn as nn
-from model import SimpleCNN
-from model_resnet import get_model
+from torchvision import models
 
-class EnsembleModel(nn.Module):
-    def __init__(self, input_size=28, device='cuda'):
-        super(EnsembleModel, self).__init__()
-        self.input_size = input_size
-        self.device = device
+
+class MobileNetV3ChestMNIST(nn.Module):
+    """
+    MobileNetV3-Large dengan custom classifier untuk binary classification
+    Optimized untuk ChestMNIST dataset
+    """
+    
+    def __init__(self, in_channels=1, num_classes=1, pretrained=True, dropout=0.4):
+        super(MobileNetV3ChestMNIST, self).__init__()
         
-        # Model 1: SimpleCNN Enhanced (binary classification)
-        self.model_simple = SimpleCNN(
-            in_channels=1, 
-            num_classes=1,  # Binary classification
-            dropout_rate=0.3, 
-            input_size=input_size
-        )
+        # Load pre-trained MobileNetV3-Large
+        self.mobilenet = models.mobilenet_v3_large(weights='IMAGENET1K_V2' if pretrained else None)
         
-        # Model 2: ResNet18
-        self.model_resnet = get_model(
-            model_name='resnet18',
-            pretrained=True,
-            freeze_backbone=False,
-            dropout_rate=0.5
-        )
-        
-        # Ensemble weights (learnable)
-        self.weight_simple = nn.Parameter(torch.tensor(0.6))  # SimpleCNN lebih baik
-        self.weight_resnet = nn.Parameter(torch.tensor(0.4))  # ResNet kontribusi lebih kecil
-        
-    def forward(self, x):
-        """
-        Forward pass dengan weighted averaging
-        """
-        # Pastikan input sesuai ukuran
-        if x.size(-1) != self.input_size:
-            x_resized = torch.nn.functional.interpolate(
-                x, size=(self.input_size, self.input_size), 
-                mode='bilinear', align_corners=False
+        # Modify first conv layer untuk grayscale input (1 channel)
+        if in_channels == 1:
+            original_conv = self.mobilenet.features[0][0]
+            self.mobilenet.features[0][0] = nn.Conv2d(
+                in_channels, 
+                original_conv.out_channels,
+                kernel_size=original_conv.kernel_size,
+                stride=original_conv.stride,
+                padding=original_conv.padding,
+                bias=False
             )
-        else:
-            x_resized = x
+            
+            # Transfer weights dari 3 channels ke 1 channel (average across channels)
+            if pretrained:
+                with torch.no_grad():
+                    self.mobilenet.features[0][0].weight.data = original_conv.weight.data.mean(dim=1, keepdim=True)
         
-        # Prediksi dari kedua model
-        pred_simple = self.model_simple(x_resized)
-        pred_resnet = self.model_resnet(x_resized)
+        # Get feature dimension dari classifier
+        in_features = self.mobilenet.classifier[0].in_features
         
-        # Weighted averaging dengan softmax weights
-        weights = torch.softmax(torch.stack([self.weight_simple, self.weight_resnet]), dim=0)
-        ensemble_pred = weights[0] * pred_simple + weights[1] * pred_resnet
-        
-        return ensemble_pred
+        # Custom classifier untuk binary classification dengan regularization
+        self.mobilenet.classifier = nn.Sequential(
+            nn.Linear(in_features, 1280),
+            nn.Hardswish(),  # MobileNetV3 uses Hardswish
+            nn.Dropout(p=dropout),
+            nn.Linear(1280, 640),
+            nn.Hardswish(),
+            nn.Dropout(p=dropout * 0.5),
+            nn.Linear(640, num_classes)
+        )
     
-    def load_pretrained_models(self, simple_path, resnet_path):
-        """
-        Load model yang sudah di-train sebelumnya
-        """
-        # Load SimpleCNN
-        if simple_path and os.path.exists(simple_path):
-            checkpoint = torch.load(simple_path, map_location=self.device)
-            # Handle checkpoint yang menyimpan dictionary dengan 'model_state_dict'
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                self.model_simple.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                self.model_simple.load_state_dict(checkpoint)
-            print(f"✓ SimpleCNN loaded from {simple_path}")
-        else:
-            print(f"⚠️ SimpleCNN path not found: {simple_path}, using random init")
-        
-        # Load ResNet18
-        if resnet_path and os.path.exists(resnet_path):
-            checkpoint = torch.load(resnet_path, map_location=self.device)
-            # Handle checkpoint yang menyimpan dictionary dengan 'model_state_dict'
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                self.model_resnet.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                self.model_resnet.load_state_dict(checkpoint)
-            print(f"✓ ResNet18 loaded from {resnet_path}")
-        else:
-            print(f"⚠️ ResNet18 path not found: {resnet_path}, using random init")
+    def forward(self, x):
+        return self.mobilenet(x)
+
+
+def get_mobilenet_model(in_channels=1, num_classes=1, pretrained=True, dropout=0.4):
+    """
+    Factory function untuk create MobileNetV3 model
     
-    def freeze_base_models(self):
-        """
-        Freeze kedua model untuk hanya train ensemble weights
-        """
-        for param in self.model_simple.parameters():
-            param.requires_grad = False
-        for param in self.model_resnet.parameters():
-            param.requires_grad = False
-        print("✓ Base models frozen, only ensemble weights trainable")
+    Args:
+        in_channels (int): Number of input channels (1 for grayscale)
+        num_classes (int): Number of output classes (1 for binary)
+        pretrained (bool): Use ImageNet pre-trained weights
+        dropout (float): Dropout rate
     
-    def unfreeze_all(self):
-        """
-        Unfreeze semua untuk fine-tuning
-        """
-        for param in self.model_simple.parameters():
-            param.requires_grad = True
-        for param in self.model_resnet.parameters():
-            param.requires_grad = True
-        print("✓ All parameters unfrozen for fine-tuning")
+    Returns:
+        model: MobileNetV3ChestMNIST model
+    """
+    model = MobileNetV3ChestMNIST(
+        in_channels=in_channels,
+        num_classes=num_classes,
+        pretrained=pretrained,
+        dropout=dropout
+    )
+    return model
 
 
-class VotingEnsemble:
-    """
-    Hard voting ensemble untuk prediksi biner
-    """
-    def __init__(self, models, device='cuda'):
-        self.models = models
-        self.device = device
-        
-    def predict(self, x):
-        """
-        Hard voting: mayoritas menang
-        """
-        predictions = []
-        for model in self.models:
-            model.eval()
-            with torch.no_grad():
-                pred = model(x)
-                predictions.append((pred > 0.5).float())
-        
-        # Voting
-        votes = torch.stack(predictions).sum(dim=0)
-        final_pred = (votes > len(self.models) / 2).float()
-        
-        return final_pred
-
-
-class AveragingEnsemble:
-    """
-    Soft voting ensemble dengan probability averaging
-    """
-    def __init__(self, models, weights=None, device='cuda'):
-        self.models = models
-        self.device = device
-        
-        # Default equal weights
-        if weights is None:
-            self.weights = [1.0 / len(models)] * len(models)
-        else:
-            self.weights = weights
+if __name__ == "__main__":
+    # Test model
+    print("Testing MobileNetV3-Large model...")
+    model = get_mobilenet_model(in_channels=1, num_classes=1, pretrained=True, dropout=0.4)
     
-    def predict(self, x):
-        """
-        Weighted averaging dari probabilities
-        """
-        predictions = []
-        for model, weight in zip(self.models, self.weights):
-            model.eval()
-            with torch.no_grad():
-                pred = torch.sigmoid(model(x))
-                predictions.append(pred * weight)
-        
-        # Weighted average
-        final_pred = torch.stack(predictions).sum(dim=0)
-        
-        return final_pred
-
-
-def create_ensemble_from_checkpoints(simple_path, resnet_path, input_size=28, device='cuda'):
-    """
-    Helper function untuk create ensemble dari checkpoint files
-    """
-    ensemble = EnsembleModel(input_size=input_size, device=device)
-    ensemble.load_pretrained_models(simple_path, resnet_path)
-    ensemble.to(device)
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
-    return ensemble
-
-
-import os
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Test forward pass
+    x = torch.randn(2, 1, 128, 128)
+    output = model(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {output.shape}")
+    print("Model test successful!")
