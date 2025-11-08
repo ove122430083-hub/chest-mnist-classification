@@ -1,25 +1,49 @@
-
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset
 from medmnist import ChestMNIST
+from PIL import Image, ImageFilter
 
 # --- Konfigurasi Kelas Biner ---
 CLASS_A_IDX = 1  # 'Cardiomegaly'
-CLASS_B_IDX = 7 # 'Pneumothorax'
+CLASS_B_IDX = 7  # 'Pneumothorax'
 
-# --- Data Augmentation untuk Training (Medical-Safe) ---
-# NOTE: Augmentation MENURUNKAN performa untuk dataset ini!
-# Best practice: TIDAK menggunakan augmentation
+# --- UPGRADE: High Resolution (128x128) untuk Better Feature Learning ---
+TARGET_RESOLUTION = 128  # Naik dari 28x28 ke 128x128
+
+# --- Medical-Safe Augmentation (Conservative) ---
+# Hanya gunakan transformasi yang aman untuk chest X-ray
 TRAIN_TRANSFORM = transforms.Compose([
+    # 1. Resize ke resolusi tinggi
+    transforms.Resize((TARGET_RESOLUTION, TARGET_RESOLUTION), 
+                     interpolation=transforms.InterpolationMode.BICUBIC),
+    
+    # 2. Geometric augmentations (subtle untuk medical images)
+    transforms.RandomRotation(degrees=5),  # Sangat kecil untuk menghindari distorsi anatomi
+    transforms.RandomAffine(
+        degrees=0, 
+        translate=(0.05, 0.05),  # Subtle shift
+        scale=None,  # No scaling untuk preserve size
+    ),
+    
+    # 3. Intensity augmentations (safe untuk chest X-ray)
+    transforms.RandomApply([
+        transforms.Lambda(lambda x: x.filter(ImageFilter.SHARPEN))
+    ], p=0.3),  # Sharpen untuk enhance edges
+    
+    transforms.RandomAutocontrast(p=0.3),  # Automatic contrast adjustment
+    
+    # 4. Convert to tensor and normalize
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5], std=[0.5])  # Normalisasi
+    transforms.Normalize(mean=[0.5], std=[0.5])
 ])
 
 # --- Transform untuk Validation (tanpa augmentation) ---
 VAL_TRANSFORM = transforms.Compose([
+    transforms.Resize((TARGET_RESOLUTION, TARGET_RESOLUTION),
+                     interpolation=transforms.InterpolationMode.BICUBIC),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5], std=[0.5])
 ])
@@ -51,154 +75,172 @@ class FilteredBinaryDataset(Dataset):
         original_labels = full_dataset.labels
 
         # Cari indeks untuk gambar yang HANYA memiliki satu label yang kita inginkan
+        # ChestMNIST uses multi-hot encoding: shape (N, 14) where each column is a class
         indices_a = np.where((original_labels[:, CLASS_A_IDX] == 1) & (original_labels.sum(axis=1) == 1))[0]
         indices_b = np.where((original_labels[:, CLASS_B_IDX] == 1) & (original_labels.sum(axis=1) == 1))[0]
 
-        # Simpan gambar dan label yang sudah dipetakan ulang
-        self.images = []
+        # Simpan data yang sudah difilter
+        self.imgs = []
         self.labels = []
 
         # Tambahkan data untuk kelas Cardiomegaly (dipetakan ke label 0)
         for idx in indices_a:
-            self.images.append(full_dataset[idx][0])
+            self.imgs.append(full_dataset.imgs[idx])
             self.labels.append(0)
 
         # Tambahkan data untuk kelas Pneumothorax (dipetakan ke label 1)
         for idx in indices_b:
-            self.images.append(full_dataset[idx][0])
+            self.imgs.append(full_dataset.imgs[idx])
             self.labels.append(1)
         
-        print(f"Split: {split}")
-        print(f"Jumlah Cardiomegaly (label 0): {len(indices_a)}")
-        print(f"Jumlah Pneumothorax (label 1): {len(indices_b)}")
-        print()
-
+        self.imgs = np.array(self.imgs)
+        self.labels = np.array(self.labels)
+        
+        print(f"[{split.upper()}] Total samples: {len(self.imgs)}")
+        print(f"  - Cardiomegaly: {np.sum(self.labels == 0)}")
+        print(f"  - Pneumothorax: {np.sum(self.labels == 1)}")
+    
     def __len__(self):
         return len(self.labels)
-
+    
     def __getitem__(self, idx):
-        image = self.images[idx]
+        img = self.imgs[idx]
         label = self.labels[idx]
-
+        
+        # Convert numpy array to PIL Image
+        img = Image.fromarray(img.squeeze(), mode='L')  # 'L' for grayscale
+        
+        # Apply transform
         if self.transform:
-            image = self.transform(image)
-            
-        return image, torch.tensor([label])
+            img = self.transform(img)
+        
+        # Return label as tensor with correct shape
+        return img, torch.tensor(label, dtype=torch.float32)
 
-def get_data_loaders(batch_size, use_augmentation=True):
+def get_data_loaders(batch_size=32, use_augmentation=True):
     """
-    Get data loaders with optional data augmentation for training.
+    Membuat DataLoader untuk training dan validation.
     
     Args:
-        batch_size: Batch size for dataloaders
-        use_augmentation: If True, apply data augmentation to training data
+        batch_size: Ukuran batch
+        use_augmentation: Jika True, gunakan augmentasi untuk training
     
     Returns:
-        train_loader, val_loader, num_classes, in_channels
+        train_loader, val_loader, num_classes (2), in_channels (1)
     """
-    # Use augmentation for training if enabled
+    
+    # Pilih transform berdasarkan use_augmentation
     if use_augmentation:
         train_transform = TRAIN_TRANSFORM
-        print("✅ Data Augmentation AKTIF untuk training data")
+        print("✅ Menggunakan Medical-Safe Augmentation + High Resolution")
     else:
         train_transform = VAL_TRANSFORM
-        print("⚠️  Data Augmentation TIDAK AKTIF")
+        print("⚠️ Tidak menggunakan augmentasi (only high resolution)")
     
-    # Validation always uses basic transform (no augmentation)
-    val_transform = VAL_TRANSFORM
+    # Buat dataset
+    train_dataset = FilteredBinaryDataset(split='train', transform=train_transform)
+    val_dataset = FilteredBinaryDataset(split='val', transform=VAL_TRANSFORM)
+    
+    # Buat DataLoader
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,  # Set to 0 untuk Windows compatibility
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True
+    )
+    
+    num_classes = 1  # Binary classification (output sigmoid)
+    in_channels = 1  # Grayscale images
+    
+    print(f"\n📊 Dataset Summary:")
+    print(f"  - Input Resolution: {TARGET_RESOLUTION}x{TARGET_RESOLUTION}")
+    print(f"  - Training samples: {len(train_dataset)}")
+    print(f"  - Validation samples: {len(val_dataset)}")
+    print(f"  - Batch size: {batch_size}")
+    print(f"  - Num classes: {num_classes} (binary)")
+    print(f"  - In channels: {in_channels} (grayscale)\n")
+    
+    return train_loader, val_loader, num_classes, in_channels
 
-    train_dataset = FilteredBinaryDataset('train', train_transform)
-    val_dataset = FilteredBinaryDataset('test', val_transform)
+def calculate_class_weights(train_loader):
+    """Menghitung class weights untuk weighted loss function."""
     
-    train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, shuffle=False)
+    all_labels = []
+    for _, labels in train_loader:
+        all_labels.extend(labels.numpy())
     
-    n_classes = 2
-    n_channels = 1
+    all_labels = np.array(all_labels)
     
-    print("Dataset ChestMNIST berhasil difilter untuk klasifikasi biner!")
-    print(f"Kelas yang digunakan: {NEW_CLASS_NAMES[0]} (Label 0) dan {NEW_CLASS_NAMES[1]} (Label 1)")
-    print(f"Jumlah data training: {len(train_dataset)}")
-    print(f"Jumlah data validasi: {len(val_dataset)}")
+    # Hitung jumlah sampel per kelas
+    class_0_count = np.sum(all_labels == 0)  # Cardiomegaly
+    class_1_count = np.sum(all_labels == 1)  # Pneumothorax
     
-    return train_loader, val_loader, n_classes, n_channels
+    total = len(all_labels)
+    
+    # Hitung weight (inverse frequency)
+    weight_class_0 = total / (2 * class_0_count)
+    weight_class_1 = total / (2 * class_1_count)
+    
+    print(f"Class Weights:")
+    print(f"  - Cardiomegaly (0): {weight_class_0:.4f}")
+    print(f"  - Pneumothorax (1): {weight_class_1:.4f}")
+    
+    return torch.tensor([weight_class_0, weight_class_1], dtype=torch.float32)
 
-def show_samples(dataset):
-    cardiomegaly_imgs = []
-    pneumothorax_imgs = []
+def visualize_batch(data_loader, num_images=8):
+    """Visualisasi batch dari data loader."""
     
-    for img, label in dataset:
-        if label.item() == 0 and len(cardiomegaly_imgs) < 5:
-            cardiomegaly_imgs.append(img)
-        elif label.item() == 1 and len(pneumothorax_imgs) < 5:
-            pneumothorax_imgs.append(img)
+    images, labels = next(iter(data_loader))
+    
+    # Denormalize
+    mean = 0.5
+    std = 0.5
+    images = images * std + mean
+    
+    fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+    axes = axes.ravel()
+    
+    for i in range(min(num_images, len(images))):
+        img = images[i].squeeze().cpu().numpy()
+        label = labels[i].item()
+        class_name = NEW_CLASS_NAMES[int(label)]
         
-        if len(cardiomegaly_imgs) == 5 and len(pneumothorax_imgs) == 5:
-            break
-            
-    fig, axes = plt.subplots(2, 5, figsize=(15, 6))
-    fig.suptitle("Perbandingan Gambar: Cardiomegaly (atas) vs Pneumothorax (bawah)", fontsize=16)
+        axes[i].imshow(img, cmap='gray')
+        axes[i].set_title(f'{class_name}')
+        axes[i].axis('off')
     
-    for i, img in enumerate(cardiomegaly_imgs):
-        ax = axes[0, i]
-        ax.imshow(img.squeeze(), cmap='gray')
-        ax.set_title(f"Cardiomegaly #{i+1}")
-        ax.axis('off')
-        
-    for i, img in enumerate(pneumothorax_imgs):
-        ax = axes[1, i]
-        ax.imshow(img.squeeze(), cmap='gray')
-        ax.set_title(f"Pneumothorax #{i+1}")
-        ax.axis('off')
-        
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.show()
+    plt.tight_layout()
+    plt.savefig('sample_batch_highres.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("✅ Batch visualization saved to 'sample_batch_highres.png'")
 
-def show_class_distribution(split='train'):
-    full_dataset = ChestMNIST(split=split, transform=None, download=True)
-    original_labels = full_dataset.labels
+if __name__ == "__main__":
+    print("=" * 60)
+    print("HIGH RESOLUTION DATAREADER TEST")
+    print("=" * 60)
     
-    class_counts = {}
-    for idx, class_name in enumerate(ALL_CLASS_NAMES):
-        count = np.where((original_labels[:, idx] == 1) & (original_labels.sum(axis=1) == 1))[0].shape[0]
-        class_counts[class_name] = count
+    # Test dengan augmentation
+    train_loader, val_loader, num_classes, in_channels = get_data_loaders(
+        batch_size=32,
+        use_augmentation=True
+    )
     
-    # Urutkan berdasarkan jumlah (descending)
-    sorted_classes = sorted(class_counts.items(), key=lambda x: x[1], reverse=True)
+    # Visualize
+    print("\n🖼️ Creating visualization...")
+    visualize_batch(train_loader, num_images=8)
     
-    print(f"\n{'='*60}")
-    print(f"Distribusi Kelas di ChestMNIST ({split.upper()} set)")
-    print(f"(Hanya single-label samples)")
-    print(f"{'='*60}")
-    print(f"{'No':<4} {'Kelas':<25} {'Jumlah Sampel':<15}")
-    print(f"{'-'*60}")
-    
-    total_samples = 0
-    for i, (class_name, count) in enumerate(sorted_classes, 1):
-        print(f"{i:<4} {class_name:<25} {count:<15}")
-        total_samples += count
-    
-    print(f"{'-'*60}")
-    print(f"{'TOTAL':<29} {total_samples:<15}")
-    print(f"{'='*60}\n")
-    
-    return sorted_classes
-
-if __name__ == '__main__':
-    print("Memuat dataset untuk plotting...")
-    
-    # Tampilkan distribusi kelas
-    print("\n--- Distribusi Kelas Training Set ---")
-    show_class_distribution('train')
-    
-    print("\n--- Distribusi Kelas Test Set ---")
-    show_class_distribution('test')
-    
-    plot_transform = transforms.Compose([transforms.ToTensor()])
-    train_dataset = FilteredBinaryDataset('train', transform=plot_transform)
-    
-    if len(train_dataset) > 0:
-        print("\n--- Menampilkan 5 Contoh Gambar per Kelas ---")
-        show_samples(train_dataset)
-    else:
-        print("Dataset tidak berisi sampel untuk kelas yang dipilih.")
+    # Test satu batch
+    images, labels = next(iter(train_loader))
+    print(f"\n✅ Test successful!")
+    print(f"   Image batch shape: {images.shape}")  # Should be [32, 1, 128, 128]
+    print(f"   Label batch shape: {labels.shape}")  # Should be [32]
+    print(f"   Image range: [{images.min():.3f}, {images.max():.3f}]")
